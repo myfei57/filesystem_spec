@@ -531,6 +531,496 @@ def test_cat_ranges_on_error_raise_propagates():
 
 
 # ---------------------------------------------------------------------------
+# AsyncFileSystem._iter_ranges
+# ---------------------------------------------------------------------------
+
+
+class _EventRangeFS(fsspec.asyn.AsyncFileSystem):
+    """Fake async backend whose ``_cat_file`` calls block on per-range events.
+
+    Every call is recorded, so tests can assert how many ranges reached the
+    backend, how many ran concurrently, and which ones were cancelled.
+    """
+
+    cachable = False
+    protocol = "eventrange"
+
+    def __init__(self, payloads=None, fail=(), **kwargs):
+        super().__init__(**kwargs)
+        self.calls = []
+        self.cancelled = []
+        self.active = 0
+        self.max_active = 0
+        self.events = {}
+        self.payloads = dict(payloads or {})
+        self.fail = set(fail)
+
+    async def _cat_file(self, path, start=None, end=None, **kwargs):
+        key = (path, start, end)
+        self.calls.append(key)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            event = self.events.get(key)
+            if event is not None:
+                await event.wait()
+            if key in self.fail:
+                raise OSError(f"backend failure for {key}")
+            if key in self.payloads:
+                return self.payloads[key]
+            return b"x" * (end - start)
+        except asyncio.CancelledError:
+            self.cancelled.append(key)
+            raise
+        finally:
+            self.active -= 1
+
+
+class _CountingIter:
+    """Sync iterable recording how many items the consumer pulled."""
+
+    def __init__(self, items):
+        self.items = list(items)
+        self.reads = 0
+
+    def __iter__(self):
+        for item in self.items:
+            self.reads += 1
+            yield item
+
+
+class _CountingAsyncIter:
+    """Async iterable recording how many items the consumer pulled."""
+
+    def __init__(self, items):
+        self.items = list(items)
+        self.reads = 0
+        self._i = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._i >= len(self.items):
+            raise StopAsyncIteration
+        item = self.items[self._i]
+        self._i += 1
+        self.reads += 1
+        await asyncio.sleep(0)
+        return item
+
+
+def _no_pending_tasks():
+    current = asyncio.current_task()
+    return [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_ordered_identity_empty_and_duplicate():
+    fs = _EventRangeFS()
+    ranges = [
+        ("f", 0, 3),
+        ("f", 3, 3),  # empty range
+        ("f", 0, 3),  # duplicate of the first range
+        ("g", 1, 5),
+    ]
+    out = [
+        item
+        async for item in fs._iter_ranges(
+            ranges, ordered=True, max_inflight_bytes=100, max_inflight_items=4
+        )
+    ]
+    assert [i for i, _ in out] == [0, 1, 2, 3]
+    assert out[0][1] == b"xxx"
+    assert out[1][1] == b""
+    assert out[2][1] == b"xxx"
+    assert out[3][1] == b"xxxx"
+    # the empty range is answered without touching the backend
+    assert ("f", 3, 3) not in fs.calls
+    assert len(fs.calls) == 3
+    # duplicate ranges stay independent calls with their own identity
+    assert fs.calls.count(("f", 0, 3)) == 2
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_unordered_completion_order():
+    fs = _EventRangeFS()
+    slow = asyncio.Event()
+    fast = asyncio.Event()
+    fs.events = {("f", 0, 4): slow, ("f", 4, 8): fast}
+
+    gen = fs._iter_ranges(
+        [("f", 0, 4), ("f", 4, 8)],
+        max_inflight_bytes=100,
+        max_inflight_items=2,
+    )
+    first = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0.05)
+    assert not first.done()  # both backend calls are waiting on their events
+
+    fast.set()
+    index, data = await first
+    # the fast, later input item is delivered first, but keeps its index
+    assert (index, data) == (1, b"xxxx")
+
+    slow.set()
+    assert [item async for item in gen] == [(0, b"xxxx")]
+    await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_ordered_slow_first_respects_byte_budget():
+    fs = _EventRangeFS()
+    block_first = asyncio.Event()
+    fs.events = {("f", 0, 10): block_first}
+    source = _CountingIter([("f", 10 * i, 10 * (i + 1)) for i in range(6)])
+
+    gen = fs._iter_ranges(
+        source, ordered=True, max_inflight_bytes=25, max_inflight_items=-1
+    )
+    first = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0.05)
+    assert not first.done()
+    # 25 bytes admit two 10-byte ranges; a third would need 30. The extra
+    # pulled item is held, so only three input items have been read.
+    assert len(fs.calls) == 2
+    assert fs.max_active == 2
+    assert source.reads == 3
+
+    block_first.set()
+    head = await first
+    assert head == (0, b"x" * 10)
+    out = [head] + [item async for item in gen]
+    assert [i for i, _ in out] == list(range(6))
+    assert all(data == b"x" * 10 for _, data in out)
+    assert source.reads == 6
+    await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_item_budget_lazy_input():
+    fs = _EventRangeFS()
+    block = asyncio.Event()
+    fs.events = {("f", 0, 2): block}
+    source = _CountingIter([("f", 2 * i, 2 * (i + 1)) for i in range(5)])
+
+    gen = fs._iter_ranges(source, max_inflight_bytes=-1, max_inflight_items=2)
+    first = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0.05)
+    # the item budget caps how far the input iterator is consumed; the blocked
+    # first item still lets the second one finish and get delivered
+    assert source.reads == 2
+    assert len(fs.calls) == 2
+    index, _ = await first
+    assert index == 1
+
+    block.set()
+    rest = [item async for item in gen]
+    assert len(rest) == 4
+    assert source.reads == 5
+    await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_byte_budget_covers_buffered_results():
+    # A completed but undelivered result must keep charging the byte budget:
+    # limiting only running tasks would let the internal backlog grow without
+    # bound while the slow first item blocks delivery.
+    fs = _EventRangeFS()
+    block_first = asyncio.Event()
+    fs.events = {("f", 0, 10): block_first}
+    source = _CountingIter([("f", 10 * i, 10 * (i + 1)) for i in range(5)])
+
+    gen = fs._iter_ranges(source, max_inflight_bytes=25, max_inflight_items=-1)
+    first = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0.05)
+    assert len(fs.calls) == 2  # item 1 may be done and buffered, item 2 never starts
+
+    block_first.set()
+    index, _ = await first
+    assert index == 1  # unordered: buffered fast item delivered first
+    rest = [item async for item in gen]
+    assert len(rest) == 4
+    assert source.reads == 5
+    await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_ordered_item_budget_no_unbounded_prefetch():
+    fs = _EventRangeFS()
+    block_first = asyncio.Event()
+    fs.events = {("f", 0, 2): block_first}
+    source = _CountingIter([("f", 2 * i, 2 * (i + 1)) for i in range(5)])
+
+    gen = fs._iter_ranges(
+        source, ordered=True, max_inflight_bytes=-1, max_inflight_items=2
+    )
+    first = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0.05)
+    assert not first.done()
+    # item 1 has finished and is buffered behind the blocked head, but the
+    # item budget still stops the iterator from pulling any more input
+    assert source.reads == 2
+    assert len(fs.calls) == 2
+
+    block_first.set()
+    out = [await first] + [item async for item in gen]
+    assert [i for i, _ in out] == [0, 1, 2, 3, 4]
+    await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_forwards_kwargs_to_cat_file():
+    fs = _EventRangeFS()
+    seen = []
+
+    async def spy(path, start=None, end=None, **kwargs):
+        seen.append(kwargs)
+        return b"z" * (end - start)
+
+    fs._cat_file = spy
+    async for _ in fs._iter_ranges(
+        [("f", 0, 1), ("f", 1, 2)], max_inflight_bytes=10, block_size=42
+    ):
+        pass
+    assert seen == [{"block_size": 42}, {"block_size": 42}]
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_empty_input_and_default_limits():
+    fs = _EventRangeFS()
+    assert [item async for item in fs._iter_ranges([])] == []
+    assert fs.calls == []
+    # default limits accept an ordinary stream
+    assert [item async for item in fs._iter_ranges([("f", 0, 3)])] == [(0, b"xxx")]
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_oversized_rejected_without_backend_call():
+    fs = _EventRangeFS()
+    ranges = [("f", 0, 100), ("f", 0, 2)]
+
+    gen = fs._iter_ranges(ranges, max_inflight_bytes=50, max_inflight_items=4)
+    out = dict([item async for item in gen])
+    assert isinstance(out[0], ValueError)
+    assert "max_inflight_bytes" in str(out[0])
+    assert out[1] == b"xx"
+    assert fs.calls == [("f", 0, 2)]
+    await gen.aclose()
+
+    with pytest.raises(ValueError, match="max_inflight_bytes"):
+        async for _ in fs._iter_ranges(ranges, max_inflight_bytes=50, on_error="raise"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_backend_error_return_inline():
+    fs = _EventRangeFS(fail={("f", 0, 4)})
+    out = dict(
+        [
+            item
+            async for item in fs._iter_ranges(
+                [("f", 0, 4), ("f", 4, 8)],
+                max_inflight_bytes=100,
+                max_inflight_items=2,
+            )
+        ]
+    )
+    assert isinstance(out[0], OSError)
+    assert out[1] == b"xxxx"
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_on_error_raise_cancels_pending():
+    fs = _EventRangeFS(fail={("f", 4, 8)})
+    block = asyncio.Event()
+    fs.events = {("f", 0, 4): block}
+    gen = fs._iter_ranges(
+        [("f", 0, 4), ("f", 4, 8)],
+        max_inflight_bytes=100,
+        max_inflight_items=2,
+        on_error="raise",
+    )
+    with pytest.raises(OSError):
+        async for _ in gen:
+            pass
+    # the still-blocked task is cancelled rather than leaked
+    assert ("f", 0, 4) in fs.cancelled
+    assert not _no_pending_tasks()
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_short_and_over_read_are_contract_errors():
+    fs = _EventRangeFS(
+        payloads={
+            ("f", 0, 4): b"abc",  # short read
+            ("g", 0, 4): b"abcde",  # over-long read
+        }
+    )
+    out = dict(
+        [
+            item
+            async for item in fs._iter_ranges(
+                [("f", 0, 4), ("g", 0, 4)],
+                max_inflight_bytes=100,
+                max_inflight_items=2,
+            )
+        ]
+    )
+    assert isinstance(out[0], ValueError) and "short read" in str(out[0])
+    assert isinstance(out[1], ValueError) and "over-long read" in str(out[1])
+    # nothing is patched together from another range's data
+    assert all(isinstance(value, ValueError) for value in out.values())
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_invalid_ranges_rejected_per_policy():
+    fs = _EventRangeFS()
+    ranges = [
+        ("f", -1, 2),  # negative bound
+        ("f", 5, 2),  # end before start
+        ("f", 0, "3"),  # non-integer bound
+        ("only-two",),  # wrong shape
+        ("f", 0, 1),  # valid
+    ]
+    out = dict([item async for item in fs._iter_ranges(ranges, max_inflight_bytes=100)])
+    for i in range(4):
+        assert isinstance(out[i], (ValueError, TypeError))
+    assert out[4] == b"x"
+    assert fs.calls == [("f", 0, 1)]
+
+    with pytest.raises((ValueError, TypeError)):
+        async for _ in fs._iter_ranges(
+            [("f", -1, 2)], max_inflight_bytes=100, on_error="raise"
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_aclose_cancels_and_stops_pulling():
+    fs = _EventRangeFS()
+    first_ready = asyncio.Event()
+    second_blocked = asyncio.Event()
+    fs.events = {("f", 0, 2): first_ready, ("f", 2, 4): second_blocked}
+    source = _CountingIter([("f", 2 * i, 2 * (i + 1)) for i in range(5)])
+
+    gen = fs._iter_ranges(source, max_inflight_bytes=-1, max_inflight_items=2)
+    pending_next = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0.05)
+    assert source.reads == 2
+    assert len(fs.calls) == 2
+
+    # deliver one result, then close early while the other task is blocked
+    first_ready.set()
+    index, _ = await pending_next
+    assert index in (0, 1)
+    await gen.aclose()
+
+    # early close cancels backend work, stops reading input, leaks no tasks
+    assert ("f", 2, 4) in fs.cancelled
+    assert source.reads == 2
+    assert not _no_pending_tasks()
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_cancellation_is_not_swallowed():
+    fs = _EventRangeFS()
+    block = asyncio.Event()
+    fs.events = {("f", 0, 4): block}
+    gen = fs._iter_ranges(
+        [("f", 0, 4), ("f", 4, 8)],
+        max_inflight_bytes=100,
+        max_inflight_items=2,
+    )
+
+    async def consume():
+        async for _ in gen:
+            pass
+
+    task = asyncio.ensure_future(consume())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert ("f", 0, 4) in fs.cancelled
+    assert not _no_pending_tasks()
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_input_failure_cleans_up():
+    fs = _EventRangeFS()
+    block = asyncio.Event()
+    fs.events = {("f", 0, 4): block}
+
+    async def broken():
+        yield ("f", 0, 4)
+        await asyncio.sleep(0)  # let the backend task start and block
+        raise RuntimeError("input blew up")
+
+    gen = fs._iter_ranges(broken(), max_inflight_bytes=100, max_inflight_items=2)
+    with pytest.raises(RuntimeError, match="input blew up"):
+        async for _ in gen:
+            pass
+    assert ("f", 0, 4) in fs.cancelled
+    assert not _no_pending_tasks()
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_sync_input_failure_leaks_no_tasks():
+    fs = _EventRangeFS()
+
+    def broken():
+        yield ("f", 0, 4)
+        raise RuntimeError("sync input blew up")
+
+    # the failure may land before the scheduled backend task starts; it must
+    # still be cancelled and awaited instead of warned about at GC time
+    gen = fs._iter_ranges(broken(), max_inflight_bytes=100, max_inflight_items=2)
+    with pytest.raises(RuntimeError, match="sync input blew up"):
+        async for _ in gen:
+            pass
+    assert not _no_pending_tasks()
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_accepts_async_iterable():
+    fs = _EventRangeFS()
+    source = _CountingAsyncIter([("f", 0, 1), ("f", 1, 3)])
+    out = [
+        item
+        async for item in fs._iter_ranges(source, ordered=True, max_inflight_bytes=100)
+    ]
+    assert out == [(0, b"x"), (1, b"xx")]
+    assert source.reads == 2
+
+
+@pytest.mark.asyncio
+async def test_iter_ranges_rejects_bad_arguments():
+    fs = _EventRangeFS()
+    with pytest.raises(ValueError, match="on_error"):
+        await fs._iter_ranges([], on_error="nope").__anext__()
+    with pytest.raises(ValueError, match="max_inflight_items"):
+        await fs._iter_ranges([], max_inflight_items=0).__anext__()
+    with pytest.raises(ValueError, match="max_inflight_bytes"):
+        await fs._iter_ranges([], max_inflight_bytes=0).__anext__()
+
+
+def test_iter_ranges_sync_mirror():
+    # mirror_sync_methods exposes the async generator as a blocking one;
+    # keyword arguments are forwarded through the sync wrapper as well
+    fs = _EventRangeFS()
+    assert inspect.isgeneratorfunction(fs.iter_ranges)
+    assert list(fs.iter_ranges([("f", 0, 2), ("f", 2, 4)], ordered=True)) == [
+        (0, b"xx"),
+        (1, b"xx"),
+    ]
+    assert dict(fs.iter_ranges([("f", 0, 2), ("f", 2, 4)])) == {
+        0: b"xx",
+        1: b"xx",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tests for the prefix= hint that _glob passes to _find
 # ---------------------------------------------------------------------------
 

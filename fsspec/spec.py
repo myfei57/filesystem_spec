@@ -999,6 +999,35 @@ class AbstractFileSystem(metaclass=_Cached):
                     raise
         return out
 
+    def iter_ranges(self, ranges, on_error="return", **kwargs):
+        """Iterate over ``(path, start, end)`` byte ranges
+
+        Sync, sequential counterpart of ``AsyncFileSystem._iter_ranges``:
+        consumes ``ranges`` lazily and yields ``(index, result)`` tuples,
+        where ``index`` is the position in the input and ``result`` is the
+        fetched bytes or, with ``on_error="return"``, the exception raised
+        while fetching them.
+
+        Parameters
+        ----------
+        ranges: iterable of (path, start, end)
+            Non-negative, half-open byte ranges ``[start, end)``.
+        on_error: "return" or "raise"
+            If "return" (default), exceptions are yielded inline; otherwise
+            the first exception is raised.
+        kwargs: passed to cat_file
+        """
+        if on_error not in ("return", "raise"):
+            raise ValueError("on_error must be 'return' or 'raise'")
+        for index, (path, start, end) in enumerate(ranges):
+            try:
+                result = self.cat_file(path, start, end, **kwargs)
+            except Exception as exc:
+                if on_error == "raise":
+                    raise
+                result = exc
+            yield index, result
+
     def cat(self, path, recursive=False, on_error="raise", **kwargs):
         """Fetch (potentially multiple) paths' contents
 

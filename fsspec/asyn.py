@@ -323,6 +323,11 @@ else:
 
 _DEFAULT_BATCH_SIZE = 128
 _NOFILES_DEFAULT_BATCH_SIZE = 1280
+# Default backpressure limits for AsyncFileSystem._iter_ranges. The byte budget
+# counts the *expected* (end - start) bytes of every item that has been read
+# from the input but whose result has not yet been handed to the caller.
+_DEFAULT_ITER_RANGES_MAX_INFLIGHT_BYTES = 64 * 2**20
+_DEFAULT_ITER_RANGES_MAX_INFLIGHT_ITEMS = 32
 
 
 def _get_batch_size(nofiles=False):
@@ -444,6 +449,38 @@ async def _run_coros_in_chunks(
                 del first_exc, task
 
     return results
+
+
+async def _as_async_iter(iterable):
+    """Yield the items of either a sync or an async iterable."""
+    if hasattr(iterable, "__anext__"):
+        async for item in iterable:
+            yield item
+    else:
+        for item in iterable:
+            yield item
+
+
+def _check_iter_ranges_limit(value, name):
+    if not isinstance(value, numbers.Integral) or (value != -1 and value < 1):
+        raise ValueError(f"{name} must be a positive integer, or -1 for unlimited")
+
+
+def _coerce_iter_range(raw):
+    """Validate one ``(path, start, end)`` half-open, non-negative range."""
+    try:
+        path, start, end = raw
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "iter_ranges expects each input item to be a (path, start, end) tuple"
+        ) from exc
+    if not isinstance(start, numbers.Integral) or not isinstance(end, numbers.Integral):
+        raise TypeError("iter_ranges range bounds must be integers")
+    if start < 0 or end < 0:
+        raise ValueError("iter_ranges only accepts non-negative range bounds")
+    if end < start:
+        raise ValueError("iter_ranges requires half-open ranges with end >= start")
+    return path, start, end
 
 
 # these methods should be implemented as async by any async-able backend
@@ -715,6 +752,223 @@ class AsyncFileSystem(AbstractFileSystem):
                 finally:
                     del ex, out
         return out
+
+    async def _iter_ranges(
+        self,
+        ranges,
+        *,
+        max_inflight_bytes=None,
+        max_inflight_items=None,
+        on_error="return",
+        ordered=False,
+        **kwargs,
+    ):
+        """Iteratively fetch ``(path, start, end)`` byte ranges
+
+        Unlike ``_cat_ranges``, the input is consumed lazily and results are
+        yielded as soon as they are available, instead of being gathered into
+        one list. Each yielded item is ``(index, result)`` where ``index`` is
+        the position of the range in the input (never reordered) and
+        ``result`` is either the fetched ``bytes`` or the exception raised
+        while fetching them.
+
+        Parameters
+        ----------
+        ranges: iterable or async iterable of (path, start, end)
+            Lazily consumed range specifications. Bounds must be known,
+            non-negative integers describing half-open ranges ``[start, end)``.
+        max_inflight_bytes: int or None
+            Total expected bytes (``end - start``) of items that have been
+            read from the input but whose results have not been handed back
+            to the caller. A single range longer than this is rejected
+            without calling the backend. ``-1`` means unlimited; defaults to
+            ``_DEFAULT_ITER_RANGES_MAX_INFLIGHT_BYTES``. This bounds the
+            expected responses of a conforming backend and the data buffered
+            inside this iterator; it cannot bound temporary allocations made
+            by the backend itself.
+        max_inflight_items: int or None
+            Maximum number of items that are being read by the backend or
+            whose completed results are buffered internally awaiting delivery.
+            ``-1`` means unlimited; defaults to
+            ``_DEFAULT_ITER_RANGES_MAX_INFLIGHT_ITEMS``.
+        on_error: "return" or "raise"
+            With "return" (default), exceptions are yielded as the result of
+            their range. With "raise", the first exception is raised and all
+            tasks already created are cancelled and awaited.
+        ordered: bool
+            If False (default), results are yielded in completion order. If
+            True, results are yielded in input order; a slow early range
+            delays later deliveries but the inflight limits still apply, so
+            no unbounded prefetching happens.
+        kwargs: passed to ``_cat_file``
+
+        Notes
+        -----
+        Empty ranges (``start == end``) resolve to ``b""`` without calling
+        ``_cat_file``. Duplicate ranges are handled independently and keep
+        their own input index. Every backend result must contain exactly
+        ``end - start`` bytes; short or over-long reads are reported as
+        errors rather than patched up with another range's data.
+        """
+        if on_error not in ("return", "raise"):
+            raise ValueError("on_error must be 'return' or 'raise'")
+        if max_inflight_bytes is None:
+            max_inflight_bytes = _DEFAULT_ITER_RANGES_MAX_INFLIGHT_BYTES
+        if max_inflight_items is None:
+            max_inflight_items = _DEFAULT_ITER_RANGES_MAX_INFLIGHT_ITEMS
+        _check_iter_ranges_limit(max_inflight_bytes, "max_inflight_bytes")
+        _check_iter_ranges_limit(max_inflight_items, "max_inflight_items")
+
+        source = _as_async_iter(ranges)
+        # backend tasks currently running, mapped to their input index
+        pending = {}
+        # expected bytes charged against the budget per admitted input index
+        admitted = {}
+        # completed results not yet delivered to the caller, keyed by input index
+        ready = {}
+        inflight_items = 0
+        inflight_bytes = 0
+        next_index = 0
+        next_yield = 0
+        source_exhausted = False
+        # one input item may be pulled while waiting for budget to free up
+        held = None
+
+        async def _fetch(index, path, start, end):
+            try:
+                data = await self._cat_file(path, start=start, end=end, **kwargs)
+            except Exception as exc:
+                # CancelledError is a BaseException and deliberately propagates
+                return index, exc
+            expected = end - start
+            if not isinstance(data, (bytes, bytearray, memoryview)):
+                return index, TypeError(
+                    f"iter_ranges: backend for {path} [{start}, {end}) returned "
+                    f"{type(data).__name__}, expected bytes-like of {expected} "
+                    "bytes"
+                )
+            if len(data) != expected:
+                kind = "short read" if len(data) < expected else "over-long read"
+                return index, ValueError(
+                    f"iter_ranges: {kind} for {path} [{start}, {end}): backend "
+                    f"returned {len(data)} bytes, expected {expected}"
+                )
+            return index, bytes(data)
+
+        try:
+            while True:
+                # ------------------------------------------------------------
+                # Admission: pull input and schedule work while budget allows
+                # ------------------------------------------------------------
+                while not source_exhausted and (
+                    max_inflight_items < 0 or inflight_items < max_inflight_items
+                ):
+                    if held is None:
+                        try:
+                            raw = await source.__anext__()
+                        except StopAsyncIteration:
+                            source_exhausted = True
+                            break
+                        held = (next_index, raw)
+                        next_index += 1
+
+                    index, raw = held
+                    try:
+                        path, start, end = _coerce_iter_range(raw)
+                    except Exception as exc:
+                        held = None
+                        ready[index] = exc
+                        admitted[index] = 0
+                        inflight_items += 1
+                        continue
+
+                    size = end - start
+                    if size == 0:
+                        # empty range: answer directly, never touch the backend
+                        held = None
+                        ready[index] = b""
+                        admitted[index] = 0
+                        inflight_items += 1
+                        continue
+
+                    if max_inflight_bytes >= 0 and size > max_inflight_bytes:
+                        held = None
+                        ready[index] = ValueError(
+                            f"iter_ranges: range {path} [{start}, {end}) of "
+                            f"{size} bytes exceeds max_inflight_bytes="
+                            f"{max_inflight_bytes}"
+                        )
+                        admitted[index] = 0
+                        inflight_items += 1
+                        continue
+
+                    if (
+                        max_inflight_bytes >= 0
+                        and inflight_bytes + size > max_inflight_bytes
+                    ):
+                        # wait for delivered results to release byte budget;
+                        # the pulled item stays held and is not rescheduled
+                        break
+
+                    held = None
+                    task = asyncio.ensure_future(_fetch(index, path, start, end))
+                    pending[task] = index
+                    admitted[index] = size
+                    inflight_items += 1
+                    inflight_bytes += size
+
+                # ------------------------------------------------------------
+                # Delivery: release budget only as results reach the caller
+                # ------------------------------------------------------------
+                if ordered:
+                    while next_yield in ready:
+                        result = ready.pop(next_yield)
+                        inflight_bytes -= admitted.pop(next_yield)
+                        inflight_items -= 1
+                        next_yield += 1
+                        if isinstance(result, BaseException) and on_error == "raise":
+                            raise result
+                        yield next_yield - 1, result
+                elif ready:
+                    for index in list(ready):
+                        result = ready.pop(index)
+                        inflight_bytes -= admitted.pop(index)
+                        inflight_items -= 1
+                        if isinstance(result, BaseException) and on_error == "raise":
+                            raise result
+                        yield index, result
+
+                # ------------------------------------------------------------
+                # Wait for backend work, or finish / retry admission
+                # ------------------------------------------------------------
+                if source_exhausted and not pending:
+                    # with nothing still running, delivery above has drained
+                    # every buffered result, so the stream is complete
+                    return
+                if not pending:
+                    # no backend task to await: freed budget or a newly pulled
+                    # item must make progress on the next admission pass
+                    continue
+
+                done, _ = await asyncio.wait(
+                    set(pending), return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    result_index, result = task.result()
+                    pending.pop(task)
+                    ready[result_index] = result
+        finally:
+            # always tear down: caller aclose, cancellation, on_error="raise",
+            # or an input iterator failure all land here. No task is left
+            # un-awaited and CancelledError is never swallowed.
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            pending.clear()
+            aclose = getattr(source, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     async def _put_file(self, lpath, rpath, mode="overwrite", **kwargs):
         raise NotImplementedError
