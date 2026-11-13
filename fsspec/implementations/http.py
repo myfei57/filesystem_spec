@@ -5,6 +5,7 @@ import random
 import re
 import weakref
 from copy import copy
+from typing import NamedTuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -19,6 +20,7 @@ from fsspec.utils import (
     glob_translate,
     isfilelike,
     nullcontext,
+    parse_content_range_header,
     range_response_window,
     response_is_requested_range,
     tokenize,
@@ -34,6 +36,35 @@ from ..caching import AllBytes
 ex = re.compile(r"""<(a|A)\s[^<>]*?(?<=\s)(href|HREF)=["'](?P<url>[^"']+)""")
 ex2 = re.compile(r"""(?P<url>http[s]?://[-a-zA-Z0-9@:%_+.~#?&/=]+)""")
 logger = logging.getLogger("fsspec.http")
+
+
+class HTTPResourceStaleError(OSError):
+    """An etag-locked handle found that its remote resource is no longer the
+    version it was opened on.
+
+    Raised instead of mixing bytes from two resource versions into one handle.
+    The affected :class:`HTTPFile` stays in its ``stale`` state: every later
+    read (including pure cache hits) keeps raising, no new ETag is fetched and
+    the error is never sent through the ordinary transient-failure retry path.
+    """
+
+
+class _HTTPIdentity(NamedTuple):
+    """The immutable identity of an HTTP resource captured at open time.
+
+    All blocks of an etag-locked handle must come from a resource matching all
+    three fields, so two versions of the same URL never share block data.
+    """
+
+    url: str  # final URL, after any redirects
+    size: int  # trusted total length of the identity representation
+    etag: str  # strong ETag, exactly as returned by the server
+
+
+def _is_weak_etag(etag):
+    """Whether an ETag header value uses the weak ``W/`` indicator."""
+    return bool(etag) and etag.lstrip()[:2].upper() == "W/"
+
 
 _RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 # dropped or reset connections, truncated bodies, timeouts
@@ -54,6 +85,10 @@ def _is_retryable(exc, statuses=_RETRYABLE_STATUSES, exceptions=None):
     are deterministic. Anything else (including the ``FileNotFoundError``/
     ``PermissionError`` a subclass may map 4xx codes to) propagates at once.
     """
+    if isinstance(exc, HTTPResourceStaleError):
+        # a detected version change is terminal for the handle, even when the
+        # caller widened ``retry_exceptions`` to cover arbitrary errors
+        return False
     if isinstance(exc, aiohttp.ClientResponseError):
         return exc.status in statuses
     if exceptions is None:
@@ -147,6 +182,7 @@ class HTTPFileSystem(AsyncFileSystem):
         retry_wait=1.0,
         retry_statuses=None,
         retry_exceptions=None,
+        etag_lock=False,
         **storage_options,
     ):
         """
@@ -187,8 +223,15 @@ class HTTPFileSystem(AsyncFileSystem):
             Errors other than a response status that are retried; default
             (None) is dropped or reset connections (except SSL failures),
             truncated bodies and timeouts.
+        etag_lock: bool
+            Default for the ``etag_lock`` argument of :meth:`open`. When true,
+            opened random-read handles are pinned, at open time, to one HTTP
+            resource version (final URL, length and strong ETag); handles that
+            detect a different version afterwards become stale rather than
+            mixing bytes from two versions. The default (False) keeps the
+            historical, version-agnostic read behaviour.
         storage_options: key-value
-            Any other parameters passed on to requests
+            Any other parameters passed on to requests calls
         cache_type, cache_options: defaults used in open()
         """
         super().__init__(self, asynchronous=asynchronous, loop=loop, **storage_options)
@@ -210,6 +253,7 @@ class HTTPFileSystem(AsyncFileSystem):
             retry_statuses if retry_statuses is not None else _RETRYABLE_STATUSES
         )
         self.retry_exceptions = retry_exceptions
+        self.etag_lock = bool(etag_lock)
         self.kwargs = storage_options
         self._session = None
 
@@ -483,6 +527,7 @@ class HTTPFileSystem(AsyncFileSystem):
         cache_type=None,
         cache_options=None,
         size=None,
+        etag_lock=None,
         **kwargs,
     ):
         """Make a file-like object
@@ -496,12 +541,57 @@ class HTTPFileSystem(AsyncFileSystem):
         block_size: int or None
             Bytes to download in one request; use instance value if None. If
             zero, will return a streaming Requests file-like instance.
+        etag_lock: bool or None
+            Pin the handle to one resource version (final URL, length and a
+            strong ETag), established by a probe request at open time. A
+            caller-supplied ``size`` does not skip the probe. The handle
+            becomes stale if any later range request no longer matches that
+            identity. None falls back to the filesystem default. The default
+            mode is unchanged.
         kwargs: key-value
             Any other parameters, passed to requests calls
         """
         if mode != "rb":
             raise NotImplementedError
         block_size = block_size if block_size is not None else self.block_size
+        etag_lock = self.etag_lock if etag_lock is None else bool(etag_lock)
+        if etag_lock:
+            if not block_size:
+                raise ValueError(
+                    "etag_lock requires a random-access HTTPFile; open with a "
+                    "non-zero block_size instead of a streaming handle"
+                )
+            # The version probe always runs, even when the caller already knows
+            # the size: the size alone cannot identify the resource version.
+            identity = sync(self.loop, self._probe_resource_identity, path, **kwargs)
+            if size is not None and size != identity.size:
+                raise ValueError(
+                    f"etag_lock size mismatch for {path}: caller gave {size}, "
+                    f"but the server reports {identity.size} for ETag "
+                    f"{identity.etag}"
+                )
+            session = sync(self.loop, self.set_session)
+            # merge filesystem-level request options with per-call ones, as the
+            # default branch does, so handles opened via fsspec.open() keep the
+            # headers/options given to the filesystem constructor
+            kw = self.kwargs.copy()
+            kw.update(kwargs)
+            return HTTPFile(
+                self,
+                path,
+                session=session,
+                block_size=block_size,
+                mode=mode,
+                size=identity.size,
+                cache_type=cache_type or self.cache_type,
+                cache_options=cache_options or self.cache_options,
+                loop=self.loop,
+                etag_lock=True,
+                identity=identity,
+                asynchronous=self.asynchronous,
+                **kw,
+            )
+
         kw = self.kwargs.copy()
         kw["asynchronous"] = self.asynchronous
         kw.update(kwargs)
@@ -531,7 +621,95 @@ class HTTPFileSystem(AsyncFileSystem):
                 **kw,
             )
 
+    async def _probe_resource_identity(self, url, **kwargs):
+        """Establish the trusted (final URL, size, strong ETag) identity.
+
+        A one-byte ranged GET proves range support and yields the total length
+        via Content-Range, the strong ETag and the final URL after redirects,
+        all for the identity representation. The mode is rejected before any
+        large body is read when the server ignores ranges, compresses the
+        representation or cannot provide a strong ETag / definite size.
+        """
+        kw = self.kwargs.copy()
+        kw.update(kwargs)
+        headers = kw.pop("headers", {}).copy()
+        explicit_encoding = headers.get("Accept-Encoding")
+        if explicit_encoding and explicit_encoding.lower() != "identity":
+            raise ValueError(
+                "etag_lock requires the identity (uncompressed) representation, "
+                f"but Accept-Encoding={explicit_encoding!r} was requested"
+            )
+        headers["Accept-Encoding"] = "identity"
+        headers["Range"] = "bytes=0-0"
+        session = await self.set_session()
+
+        async def _once():
+            r = await session.get(self.encode_url(url), headers=headers, **kw)
+            async with r:
+                etag = r.headers.get("ETag")
+                if r.status == 416:
+                    # an empty resource is the only satisfiable 416 case
+                    _, _, total = parse_content_range_header(r.headers)
+                    if (
+                        total == 0
+                        and etag
+                        and not _is_weak_etag(etag)
+                        and self._identity_encoding_ok(r)
+                    ):
+                        return _HTTPIdentity(str(r.url), 0, etag)
+                    raise ValueError(
+                        f"etag_lock cannot establish the identity of {url}: "
+                        "probe returned 416 without a strong ETag and zero size"
+                    )
+                if r.status != 206:
+                    # Do not read the (possibly whole-file) body: rejecting the
+                    # mode must not silently degrade into a full download.
+                    r.raise_for_status()
+                    raise ValueError(
+                        f"etag_lock requires range support, but the probe for "
+                        f"{url} was answered with status {r.status} instead of 206"
+                    )
+                r.raise_for_status()
+                if not etag:
+                    raise ValueError(f"etag_lock requires an ETag, but {url} sent none")
+                if _is_weak_etag(etag):
+                    raise ValueError(
+                        f"etag_lock requires a strong ETag, but {url} sent the "
+                        f"weak ETag {etag!r}"
+                    )
+                if not self._identity_encoding_ok(r):
+                    raise ValueError(
+                        f"etag_lock requires the identity representation, but "
+                        f"{url} answered with Content-Encoding "
+                        f"{r.headers.get('Content-Encoding')!r}"
+                    )
+                start, end, total = parse_content_range_header(r.headers)
+                if start != 0 or end != 0 or total is None:
+                    raise ValueError(
+                        "etag_lock cannot confirm the size of "
+                        f"{url}: unexpected Content-Range "
+                        f"{r.headers.get('Content-Range')!r}"
+                    )
+                body = await r.read()
+                if len(body) != 1:
+                    raise ValueError(
+                        f"etag_lock probe of {url} expected one byte, got {len(body)}"
+                    )
+                return _HTTPIdentity(str(r.url), total, etag)
+
+        return await _with_retries(_once, self, f"{url} (etag probe)")
+
+    @staticmethod
+    def _identity_encoding_ok(response):
+        encoding = response.headers.get("Content-Encoding", "")
+        return not encoding or encoding.lower() == "identity"
+
     async def open_async(self, path, mode="rb", size=None, **kwargs):
+        if kwargs.pop("etag_lock", False) or self.etag_lock:
+            raise NotImplementedError(
+                "etag_lock is only available for random-access HTTPFile handles, "
+                "not for streaming open_async()"
+            )
         session = await self.set_session()
         if size is None:
             try:
@@ -731,6 +909,15 @@ class HTTPFile(AbstractBufferedFile):
     size: None or int
         If given, this is the size of the file in bytes, and we don't attempt
         to call the server to find the value.
+    etag_lock: bool
+        When true, every block must come from the resource version described
+        by ``identity``; a response that no longer matches it puts the handle
+        into the terminal ``stale`` state. Defaults to the historical,
+        version-agnostic behaviour.
+    identity: _HTTPIdentity or None
+        Final URL, length and strong ETag captured at open time; required when
+        ``etag_lock`` is true. The same tuple names the handle's cache, so
+        different versions of one URL never share blocks.
     kwargs: all other key-values are passed to requests calls.
     """
 
@@ -746,6 +933,8 @@ class HTTPFile(AbstractBufferedFile):
         size=None,
         loop=None,
         asynchronous=False,
+        etag_lock=False,
+        identity=None,
         **kwargs,
     ):
         if mode != "rb":
@@ -754,7 +943,27 @@ class HTTPFile(AbstractBufferedFile):
         self.loop = loop
         self.url = url
         self.session = session
-        self.details = {"name": url, "size": size, "type": "file"}
+        self.etag_lock = bool(etag_lock)
+        self.identity = identity
+        self._stale = False
+        self._stale_reason = None
+        if self.etag_lock:
+            if not isinstance(identity, _HTTPIdentity):
+                raise ValueError(
+                    "etag_lock requires an _HTTPIdentity established at open time"
+                )
+            # Name the cache by the whole identity, so handles on two versions
+            # of the same URL hash differently and never share URL-named data.
+            self.details = {
+                "name": url,
+                "size": identity.size,
+                "type": "file",
+                "url": identity.url,
+                "ETag": identity.etag,
+            }
+            size = identity.size
+        else:
+            self.details = {"name": url, "size": size, "type": "file"}
         super().__init__(
             fs=fs,
             path=url,
@@ -764,6 +973,34 @@ class HTTPFile(AbstractBufferedFile):
             cache_options=cache_options,
             **kwargs,
         )
+
+    @property
+    def stale(self):
+        """Whether the handle detected that its resource version changed.
+
+        A stale handle never delivers data again, even from bytes it had
+        cached before the change was discovered.
+        """
+        return self._stale
+
+    @property
+    def stale_reason(self):
+        """Why the handle entered the stale state, or None while fresh."""
+        return self._stale_reason
+
+    def _mark_stale(self, reason):
+        """Enter the terminal stale state and return the error to raise."""
+        if not self._stale:
+            self._stale = True
+            self._stale_reason = reason
+            logger.warning("%s became stale: %s", self, reason)
+        return HTTPResourceStaleError(f"{self}: {reason}")
+
+    def _fail_if_stale(self):
+        if self._stale:
+            raise HTTPResourceStaleError(
+                f"{self} is stale and cannot serve data: {self._stale_reason}"
+            )
 
     def read(self, length=-1):
         """Read bytes from file
@@ -775,6 +1012,10 @@ class HTTPFile(AbstractBufferedFile):
             file. If the server has not supplied the filesize, attempting to
             read only part of the data will raise a ValueError.
         """
+        if self.etag_lock:
+            # cached hits and uncached fetches alike must stop delivering once
+            # the remote version was found to have changed
+            self._fail_if_stale()
         length = -1 if length is None else length
         if (
             (length < 0 and self.loc == 0)  # explicit read all
@@ -797,6 +1038,14 @@ class HTTPFile(AbstractBufferedFile):
         """
         logger.debug(f"Fetch all for {self}")
         if not isinstance(self.cache, AllBytes):
+            if self.etag_lock:
+                out = await self._locked_request(
+                    ranged=False, start=0, end=self.identity.size
+                )
+                self.cache = AllBytes(
+                    size=len(out), fetcher=None, blocksize=None, data=out
+                )
+                return
             r = await self.session.get(self.fs.encode_url(self.url), **self.kwargs)
             async with r:
                 r.raise_for_status()
@@ -808,6 +1057,98 @@ class HTTPFile(AbstractBufferedFile):
 
     _fetch_all = sync_wrapper(async_fetch_all)
 
+    def _locked_headers(self, ranged, start=None, end=None):
+        kwargs = self.kwargs.copy()
+        headers = kwargs.pop("headers", {}).copy()
+        headers["Accept-Encoding"] = "identity"
+        headers["If-Match"] = self.identity.etag
+        if ranged:
+            headers["Range"] = f"bytes={start}-{end - 1}"
+        return kwargs, headers
+
+    async def _locked_request(self, ranged, start, end):
+        """One conditional request, fully validated against the open identity.
+
+        Every uncached byte of an etag-locked handle goes through here. The
+        whole response is checked before any of it can reach the cache, so a
+        failed read never leaves old and new fragments stitched together.
+        """
+        self._fail_if_stale()
+        kwargs, headers = self._locked_headers(ranged, start, end)
+        expected_end = min(end, self.identity.size) - 1
+        expected_len = expected_end - start + 1 if ranged else self.identity.size
+
+        async def _once():
+            r = await self.session.get(
+                self.fs.encode_url(self.url), headers=headers, **kwargs
+            )
+            async with r:
+                if r.status == 412:
+                    # The server itself reports that the version is gone.
+                    raise self._mark_stale(
+                        f"412 Precondition Failed for If-Match {self.identity.etag}"
+                    )
+                if r.status == 416:
+                    if ranged and start < self.identity.size:
+                        # an inside-file 416 is the same transient fault the
+                        # default mode retries; it does not prove a version change
+                        raise aiohttp.ClientPayloadError(
+                            f"{headers['Range']} of {self.url} reported "
+                            f"unsatisfiable, but the file has "
+                            f"{self.identity.size} bytes"
+                        )
+                    return b""
+                if ranged and r.status != 206:
+                    # Leave the (possibly whole-file) body unread: no silent
+                    # full-file fallback and no download of a large 200 body.
+                    r.raise_for_status()
+                    raise self._mark_stale(
+                        f"expected 206 for {headers['Range']}, got status {r.status}"
+                    )
+                r.raise_for_status()
+
+                final_url = str(r.url)
+                if final_url != self.identity.url:
+                    raise self._mark_stale(
+                        f"unexpected redirect: identity URL "
+                        f"{self.identity.url!r}, got {final_url!r}"
+                    )
+                etag = r.headers.get("ETag")
+                if not etag or _is_weak_etag(etag) or etag != self.identity.etag:
+                    raise self._mark_stale(
+                        f"ETag changed: expected strong {self.identity.etag!r}, "
+                        f"got {etag!r}"
+                    )
+                encoding = r.headers.get("Content-Encoding", "")
+                if encoding and encoding.lower() != "identity":
+                    raise self._mark_stale(
+                        f"server compressed the representation: "
+                        f"Content-Encoding={encoding!r}"
+                    )
+                if ranged:
+                    cr_start, cr_end, total = parse_content_range_header(r.headers)
+                    if (
+                        cr_start != start
+                        or cr_end != expected_end
+                        or total != self.identity.size
+                    ):
+                        raise self._mark_stale(
+                            f"Content-Range {r.headers.get('Content-Range')!r} "
+                            f"does not match bytes {start}-{expected_end}/"
+                            f"{self.identity.size}"
+                        )
+                out = await r.read()
+                if len(out) != expected_len:
+                    request_label = headers.get("Range", "whole file")
+                    raise self._mark_stale(
+                        f"inconsistent length for {request_label}: got "
+                        f"{len(out)} bytes, expected {expected_len}"
+                    )
+                return out
+
+        label = f"{self.url} ({headers.get('Range', 'whole file')}, etag-locked)"
+        return await _with_retries(_once, self.fs, label)
+
     async def async_fetch_range(self, start, end):
         """Download a block of data
 
@@ -817,6 +1158,8 @@ class HTTPFile(AbstractBufferedFile):
         requested, an exception is raised.
         """
         logger.debug(f"Fetch range for {self}: {start}-{end}")
+        if self.etag_lock:
+            return await self._locked_request(True, start, end)
         kwargs = self.kwargs.copy()
         headers = kwargs.pop("headers", {}).copy()
         headers["Range"] = f"bytes={start}-{end - 1}"
@@ -908,6 +1251,9 @@ def has_magic(s):
 
 
 class HTTPStreamFile(AbstractBufferedFile):
+    # streaming handles never pin a resource version
+    etag_lock = False
+
     def __init__(self, fs, url, mode="rb", loop=None, session=None, **kwargs):
         self.asynchronous = kwargs.pop("asynchronous", False)
         self.url = url
@@ -980,6 +1326,9 @@ class HTTPStreamFile(AbstractBufferedFile):
 
 
 class AsyncStreamFile(AbstractAsyncStreamedFile):
+    # streaming handles never pin a resource version
+    etag_lock = False
+
     def __init__(
         self, fs, url, mode="rb", loop=None, session=None, size=None, **kwargs
     ):
