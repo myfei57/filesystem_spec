@@ -107,6 +107,7 @@ Built-in Implementations
 ------------------------
 
 .. autosummary::
+   implementations.anchored.AnchoredLocalFileSystem
    implementations.arrow.ArrowFSWrapper
    implementations.arrow.HadoopFileSystem
    implementations.cached.CachingFileSystem
@@ -133,6 +134,9 @@ Built-in Implementations
    implementations.tar.TarFileSystem
    implementations.webhdfs.WebHDFS
    implementations.zip.ZipFileSystem
+
+.. autoclass:: fsspec.implementations.anchored.AnchoredLocalFileSystem
+   :members: __init__
 
 .. autoclass:: fsspec.implementations.arrow.ArrowFSWrapper
    :members: __init__

@@ -72,6 +72,13 @@ known_implementations = {
             "and Azure Data Lake Storage Gen2 instead."
         ),
     },
+    "anchored": {
+        "class": "fsspec.implementations.anchored.AnchoredLocalFileSystem",
+        "err": (
+            "AnchoredLocalFileSystem requires Linux openat2(2) with "
+            "RESOLVE_BENEATH/RESOLVE_NO_SYMLINKS/RESOLVE_NO_MAGICLINKS"
+        ),
+    },
     "arrow_hdfs": {
         "class": "fsspec.implementations.arrow.HadoopFileSystem",
         "err": "pyarrow and local java libraries required for HDFS",
