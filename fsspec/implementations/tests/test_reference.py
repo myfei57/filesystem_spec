@@ -6,8 +6,11 @@ import pytest
 
 import fsspec
 from fsspec.implementations.local import LocalFileSystem
+from fsspec.implementations.memory import MemoryFileSystem
 from fsspec.implementations.reference import (
+    ExtentReferenceError,
     LazyReferenceMapper,
+    MultiExtentReference,
     ReferenceFileSystem,
     ReferenceNotReachable,
 )
@@ -1162,3 +1165,529 @@ def test_no_default_jinja_execution():
 
     with pytest.raises(ZeroDivisionError):
         fsspec.filesystem("reference", fo=manifest, simple_templates=False)
+
+
+# ---------------------------------------------------------------------------
+# Spec version 2: multi-extent virtual files with explicit size and holes
+# ---------------------------------------------------------------------------
+
+
+class RecordingMemoryFS(MemoryFileSystem):
+    """Memory FS that records every physical range read it serves."""
+
+    protocol = "memory"
+    cachable = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.requests = []
+        self.short_read_paths = set()
+
+    def cat_file(self, path, start=None, end=None, **kwargs):
+        self.requests.append((path, start, end))
+        data = super().cat_file(path, start=start, end=end, **kwargs)
+        if path in self.short_read_paths and data:
+            # emulate a backend that ends the response one byte early
+            return data[:-1]
+        return data
+
+    def size(self, path):
+        raise AssertionError(f"remote size() must not be requested for {path}")
+
+
+class RecordingLocalFS(LocalFileSystem):
+    cachable = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.requests = []
+
+    def cat_file(self, path, start=None, end=None, **kwargs):
+        self.requests.append((path, start, end))
+        return super().cat_file(path, start=start, end=end, **kwargs)
+
+
+@pytest.fixture()
+def rec():
+    fs = RecordingMemoryFS()
+    fs.store.clear()
+    yield fs
+    fs.store.clear()
+
+
+def _independent_model(size, extents, sources):
+    """Assemble the virtual file without using any fsspec reference logic."""
+    buf = bytearray(size)
+    for offset, length, url, source_offset in extents:
+        if length:
+            buf[offset : offset + length] = sources[url][
+                source_offset : source_offset + length
+            ]
+    return bytes(buf)
+
+
+V2_SOURCES = {
+    "memory://a": bytes(range(256)),
+    "memory://b": b"Z" * 100,
+    "memory://c": bytes((i % 7) + 32 for i in range(50)),
+}
+
+# out-of-order on purpose: the reader must not rely on sorted input
+V2_EXTENTS = [
+    [30, 5, "memory://a", 200],
+    [2, 5, "memory://a", 10],
+    [15, 6, "memory://c", 0],
+    [8, 0, "memory://a", 0],  # zero-length, must never be fetched
+    [10, 4, "memory://b", 20],
+    [38, 2, "memory://b", 0],
+]
+V2_SIZE = 40
+
+
+def _v2_fs(rec, extents=V2_EXTENTS, size=V2_SIZE, refs=None, **kwargs):
+    for url, payload in V2_SOURCES.items():
+        rec.pipe(url, payload)
+    doc = (
+        refs
+        if refs is not None
+        else {
+            "version": 2,
+            "refs": {"v": {"size": size, "extents": extents}},
+        }
+    )
+    return fsspec.filesystem("reference", fo=doc, fs=rec, **kwargs)
+
+
+def test_v2_multi_source_matches_independent_model(rec):
+    fs = _v2_fs(rec)
+    model = _independent_model(V2_SIZE, V2_EXTENTS, V2_SOURCES)
+    assert fs.cat_file("v") == model
+
+    windows = [
+        (None, None),
+        (0, 1),
+        (3, 17),
+        (7, 12),
+        (20, 35),
+        (-10, None),
+        (None, 5),
+        (-15, -3),
+        (100, 200),
+        (5, 3),
+        (-100, 100),
+        (38, 40),
+        (0, 0),
+        (-1, -1),
+        (None, -100),
+    ]
+    for start, end in windows:
+        assert fs.cat_file("v", start=start, end=end) == model[start:end], (
+            start,
+            end,
+        )
+
+
+def test_v2_negative_slices_match_bytes_semantics(rec):
+    fs = _v2_fs(rec)
+    model = _independent_model(V2_SIZE, V2_EXTENTS, V2_SOURCES)
+    for start, end in [
+        (-1, None),
+        (-5, -2),
+        (None, -3),
+        (-100, None),
+        (2, -100),
+        (-100, -90),
+        (-V2_SIZE, None),
+        (None, -V2_SIZE),
+    ]:
+        assert fs.cat_file("v", start=start, end=end) == model[start:end]
+
+
+def test_v2_boundary_empty_reads(rec):
+    fs = _v2_fs(rec)
+    assert fs.cat_file("v", start=5, end=5) == b""
+    assert fs.cat_file("v", start=100, end=200) == b""
+    assert fs.cat_file("v", start=V2_SIZE, end=V2_SIZE + 10) == b""
+    assert fs.cat_file("v", start=3, end=2) == b""
+    assert fs.cat_file("v", start=0, end=0) == b""
+    # empty reads never touch a source
+    assert rec.requests == []
+
+
+def test_v2_all_hole_file_uses_zero_requests(rec):
+    fs = _v2_fs(
+        rec,
+        refs={"version": 2, "refs": {"h": {"size": 16, "extents": []}}},
+    )
+    assert fs.cat_file("h") == b"\x00" * 16
+    assert fs.cat_file("h", start=3, end=9) == b"\x00" * 6
+    assert fs.size("h") == 16
+    assert rec.requests == []
+
+
+def test_v2_none_extent_url_resolves_to_target(rec):
+    rec.pipe("memory://default", b"0123456789")
+    ref = MultiExtentReference(8, [[0, 3, None, 2], [5, 2, None, 7]])
+    fs = fsspec.filesystem("reference", fo={"dir/v": ref}, target="memory://default")
+    # protocol must be derivable even though every extent URL is None
+    assert fs.cat_file("dir/v") == b"234\x00\x0078\x00"
+    assert fs.ls("dir", detail=False) == ["dir/v"]
+
+
+def test_v2_zero_length_extents_have_no_side_effects(rec):
+    rec.pipe("memory://s", b"abcdef")
+    ref = MultiExtentReference(
+        6,
+        [
+            [2, 0, "memory://s", 0],
+            [0, 0, "memory://s", 3],
+            [5, 0, None, 0],
+        ],
+    )
+    fs = fsspec.filesystem("reference", fo={"v": ref}, fs=rec)
+    assert fs.cat_file("v") == b"\x00" * 6
+    assert fs.cat_file("v", 1, 4) == b"\x00" * 3
+    assert rec.requests == []
+
+
+def test_v2_small_read_only_touches_intersecting_extent(rec):
+    fs = _v2_fs(rec)
+    rec.requests.clear()
+    # logical [11, 13) sits inside the memory://b extent [10, 14)
+    assert fs.cat_file("v", start=11, end=13) == (b"Z" * 2)
+    requested = {path for path, _, _ in rec.requests}
+    assert requested == {"memory://b"}
+    # physical range must be source_offset + (logical - extent offset)
+    assert rec.requests == [("memory://b", 21, 23)]
+
+
+def test_v2_hole_read_needs_no_network(rec):
+    fs = _v2_fs(rec)
+    rec.requests.clear()
+    # [7, 10) is entirely a hole: extents cover [2,7) and [10,14)
+    assert fs.cat_file("v", start=7, end=10) == b"\x00" * 3
+    assert rec.requests == []
+
+
+def test_v2_merges_same_source_discontinuous_ranges(rec):
+    rec.pipe("memory://s", bytes(range(20)))
+    extents = [
+        [0, 2, "memory://s", 0],
+        [4, 2, "memory://s", 10],
+        [8, 2, "memory://s", 18],
+    ]
+    model = _independent_model(10, extents, {"memory://s": bytes(range(20))})
+
+    merged = _v2_fs(rec, extents=extents, size=10)
+    assert merged.cat_file("v") == model
+    # gaps (8 and 6) are below max_gap: one physical request, reassembled
+    # back into virtual order
+    assert rec.requests == [("memory://s", 0, 20)]
+
+    rec2 = RecordingMemoryFS()
+    unmerged = _v2_fs(rec2, extents=extents, size=10, max_gap=-1)
+    assert unmerged.cat_file("v") == model
+    assert sorted(rec2.requests) == sorted(
+        [
+            ("memory://s", 0, 2),
+            ("memory://s", 10, 12),
+            ("memory://s", 18, 20),
+        ]
+    )
+
+
+def test_v2_repeated_source_ranges_restore_each_position(rec):
+    source = b"abcdefghij"
+    rec.pipe("memory://s", source)
+    extents = [
+        [0, 3, "memory://s", 0],
+        [3, 3, "memory://s", 0],  # same physical range repeated
+        [6, 3, "memory://s", 4],
+    ]
+    fs = _v2_fs(rec, extents=extents, size=10)
+    # "abc" twice, then "efg", final byte is a hole
+    assert fs.cat_file("v") == b"abcabcefg\x00"
+
+
+def test_v2_different_protocols_are_never_merged(rec, tmp_path):
+    local_file = tmp_path / "loc"
+    local_file.write_bytes(b"L" * 20)
+    local_url = local_file.resolve().as_uri()
+    rec.pipe("memory://mem", b"M" * 20)
+    local = RecordingLocalFS()
+
+    extents = [
+        [0, 4, local_url, 0],
+        [4, 4, "memory://mem", 0],
+        [8, 4, local_url, 4],
+    ]
+    doc = {"version": 2, "refs": {"v": {"size": 12, "extents": extents}}}
+    fs = fsspec.filesystem("reference", fo=doc, fs={"file": local, "memory": rec})
+    assert fs.cat_file("v") == b"LLLLMMMMLLLL"
+    # same-URL local extents merge with each other; memory stays its own call
+    assert local.requests == [(local_url, 0, 8)]
+    assert rec.requests == [("memory://mem", 0, 4)]
+
+
+def test_v2_open_seek_read_readinto_matches_cat(rec):
+    fs = _v2_fs(rec)
+    model = _independent_model(V2_SIZE, V2_EXTENTS, V2_SOURCES)
+
+    with fs.open("v", block_size=3) as f:
+        assert f.read(4) == model[:4]
+        f.seek(7)
+        # crosses the hole at [7, 10) into the memory://b extent
+        assert f.read(6) == model[7:13]
+        f.seek(0)
+        buf = bytearray(10)
+        n = f.readinto(buf)
+        assert n == 10
+        assert bytes(buf) == model[:10]
+        f.seek(-4, os.SEEK_END)
+        assert f.read() == model[-4:]
+        f.seek(33)  # hole between [35, 38)
+        assert f.read(5) == model[33:38]
+
+    with fs.open("v") as f:
+        assert f.read() == fs.cat_file("v") == model
+
+
+def test_v2_info_and_ls_report_virtual_size_without_remote_calls(rec):
+    fs = _v2_fs(rec)
+    assert fs.info("v") == {"name": "v", "type": "file", "size": V2_SIZE}
+    entries = {e["name"]: e for e in fs.ls("", detail=True)}
+    assert entries["v"]["size"] == V2_SIZE
+    assert fs.sizes(["v"]) == [V2_SIZE]
+    assert fs.du("") == V2_SIZE
+    # RecordingMemoryFS.size raises: none of the above may query the backend
+    assert rec.requests == []
+
+
+@pytest.mark.asyncio
+async def test_v2_async_cat_matches_sync_and_model(rec):
+    fs = _v2_fs(rec)
+    model = _independent_model(V2_SIZE, V2_EXTENTS, V2_SOURCES)
+    for start, end in [(None, None), (1, 9), (-8, -2), (12, 40), (0, 0)]:
+        sync_out = fs.cat_file("v", start=start, end=end)
+        async_out = await fs._cat_file("v", start=start, end=end)
+        assert sync_out == async_out == model[start:end]
+
+
+def test_v2_source_error_carries_full_context(rec):
+    rec.pipe("memory://good", b"good-bytes")
+    extents = [
+        [0, 4, "memory://good", 0],
+        [6, 4, "memory://missing", 0],
+    ]
+    fs = _v2_fs(rec, extents=extents, size=10)
+
+    with pytest.raises(ExtentReferenceError) as exc_info:
+        fs.cat_file("v")
+    err = exc_info.value
+    assert isinstance(err, ReferenceNotReachable)
+    assert err.reference == "v"
+    assert err.target == "memory://missing"
+    assert err.logical_range == (0, 10)
+    assert err.source_range == (0, 4)
+    assert isinstance(err.__cause__, FileNotFoundError)
+    message = str(err)
+    assert "v" in message and "memory://missing" in message
+
+    # holes still read as zeros and the healthy extent remains readable;
+    # failures are never masked by zero-fill
+    assert fs.cat_file("v", start=0, end=6) == b"good" + b"\x00\x00"
+
+    out = fs.cat(["v"], on_error="return")
+    assert isinstance(out["v"], ExtentReferenceError)
+    assert fs.cat(["v"], on_error="omit") == {}
+
+
+def test_v2_short_read_fails_instead_of_padding(rec):
+    rec.pipe("memory://s", b"abcdefghij")
+    rec.short_read_paths.add("memory://s")
+    extents = [[0, 4, "memory://s", 2]]
+    fs = _v2_fs(rec, extents=extents, size=6)
+    with pytest.raises(ExtentReferenceError, match="short read"):
+        fs.cat_file("v")
+
+
+def test_v2_get_file_writes_assembled_bytes(rec, tmp_path):
+    fs = _v2_fs(rec)
+    model = _independent_model(V2_SIZE, V2_EXTENTS, V2_SOURCES)
+    dest = tmp_path / "out"
+    fs.get_file("v", str(dest))
+    assert dest.read_bytes() == model
+
+
+def test_v2_cat_mixed_with_classic_references(rec):
+    rec.pipe("memory://s", b"0123456789")
+    refs = {
+        "classic": ("memory://s", 1, 3),
+        "whole": ["memory://s"],
+        "v2": MultiExtentReference(5, [[0, 2, "memory://s", 5]]),
+        "inline": b"hi",
+    }
+    fs = fsspec.filesystem("reference", fo=refs, fs=rec)
+    assert fs.cat(["classic", "whole", "v2", "inline"]) == {
+        "classic": b"123",
+        "whole": b"0123456789",
+        "v2": b"56\x00\x00\x00",
+        "inline": b"hi",
+    }
+    # mapper path exercises the same batch cat machinery
+    assert fs.get_mapper("")["v2"] == b"56\x00\x00\x00"
+
+
+def test_v2_keeps_version0_1_tuple_meaning(rec):
+    rec.pipe("memory://s", b"0123456789")
+    doc = {
+        "version": 2,
+        "refs": {
+            "t": ["memory://s", 2, 4],
+            "whole": ["memory://s"],
+            "v": {"size": 2, "extents": [[0, 2, "memory://s", 6]]},
+        },
+    }
+    fs = fsspec.filesystem("reference", fo=doc, fs=rec)
+    # the 3-element tuple is still one (url, offset, size) reference
+    assert fs.cat_file("t") == b"2345"
+    assert fs.cat_file("whole") == b"0123456789"
+    assert fs.cat_file("v") == b"67"
+    assert fs.info("t")["size"] == 4
+
+
+def test_v2_validation_rejects_bad_descriptors():
+    url = "memory://s"
+    bad = [
+        (-1, []),
+        (True, []),
+        (4.0, []),
+        (float("nan"), []),
+        (float("inf"), []),
+        (4, "not-a-list"),
+        (4, [[0, 2, url, 0], [1, 2, url, 0]]),  # overlap
+        (4, [[3, 2, url, 0]]),  # beyond size
+        (4, [[-1, 1, url, 0]]),  # negative logical offset
+        (4, [[0, -1, url, 0]]),  # negative length
+        (4, [[0, 1, url, -1]]),  # negative source offset
+        (4, [[0, True, url, 0]]),  # bool masquerading as int
+        (4, [[False, 1, url, 0]]),
+        (4, [[0, 1, url, True]]),
+        (4, [[0, 1, 123, 0]]),  # url neither str nor None
+        (4, [[0, 1, url]]),  # wrong arity
+        (4, [[0, 1, url, 0, 9]]),  # wrong arity
+        (4, [[0, 1.5, url, 0]]),  # float offset
+        (4, [[0, 1, url, float("inf")]]),  # non-finite source offset
+    ]
+    for size, extents in bad:
+        with pytest.raises((TypeError, ValueError)):
+            MultiExtentReference(size, extents)
+
+
+def test_v2_overlap_is_rejected_even_when_unsorted():
+    extents = [
+        [4, 2, "memory://s", 0],
+        [0, 5, "memory://s", 0],
+    ]
+    with pytest.raises(ValueError, match="overlap"):
+        MultiExtentReference(6, extents)
+
+
+def test_v2_validates_before_any_source_access(rec):
+    doc = {
+        "version": 2,
+        "refs": {"v": {"size": 4, "extents": [[0, 5, "memory://missing", 0]]}},
+    }
+    with pytest.raises(ValueError):
+        fsspec.filesystem("reference", fo=doc, fs=rec)
+    assert rec.requests == []
+
+
+def test_v2_does_not_mutate_caller_extent_lists():
+    extents = [
+        [4, 1, "memory://s", 0],
+        [0, 2, "memory://s", 0],
+    ]
+    snapshot = [list(item) for item in extents]
+    ref = MultiExtentReference(6, extents)
+    assert isinstance(ref.extents, tuple)
+    assert extents == snapshot
+    ref.to_dict()
+    assert extents == snapshot
+
+    rec = RecordingMemoryFS()
+    rec.pipe("memory://s", b"abcdef")
+    fs = fsspec.filesystem(
+        "reference",
+        fo={"version": 2, "refs": {"v": {"size": 6, "extents": extents}}},
+        fs=rec,
+    )
+    fs.cat_file("v")
+    assert extents == snapshot
+
+
+def test_v2_save_json_roundtrip(rec):
+    rec.pipe("memory://s", b"0123456789")
+    extents = [[2, 3, "memory://s", 4], [8, 2, "memory://s", 0]]
+    original = {"size": 10, "extents": [list(item) for item in extents]}
+    doc = {
+        "version": 2,
+        "refs": {"v": original, "inline": b"data", "classic": ["memory://s", 1, 2]},
+    }
+    fs = fsspec.filesystem("reference", fo=doc, fs=rec)
+    expected = fs.cat_file("v")
+    fs.save_json("memory://out.json")
+
+    raw = json.loads(rec.cat_file("memory://out.json"))
+    assert raw["version"] == 2
+    assert raw["refs"]["v"] == original
+    assert raw["refs"]["classic"] == ["memory://s", 1, 2]
+
+    reloaded = fsspec.filesystem(
+        "reference", fo="memory://out.json", fs=RecordingMemoryFS()
+    )
+    assert isinstance(reloaded.references["v"], MultiExtentReference)
+    assert reloaded.cat_file("v") == expected
+    assert reloaded.cat_file("inline") == b"data"
+
+
+def test_save_json_without_v2_stays_version_one(m):
+    fs = fsspec.filesystem("reference", fo={"a": b"x"}, skip_instance_cache=True)
+    fs.save_json("memory://refs.json")
+    assert json.loads(m.cat_file("refs.json"))["version"] == 1
+
+
+def test_v2_write_to_existing_extent_file_is_rejected(rec, tmp_path):
+    rec.pipe("memory://good", b"abc")
+    local = tmp_path / "in"
+    local.write_bytes(b"local-bytes")
+    ref = MultiExtentReference(4, [[0, 3, "memory://good", 0]])
+    fs = fsspec.filesystem("reference", fo={"v": ref}, fs=rec)
+
+    with pytest.raises(ValueError, match="version-2"):
+        fs.pipe_file("v", b"new-inline")
+    with pytest.raises(ValueError, match="version-2"):
+        fs.put_file(str(local), "v")
+    # the v2 descriptor is still intact and readable
+    assert fs.cat_file("v") == b"abc\x00"
+
+    # an explicit, validated replacement reference is the supported update
+    fs.pipe_file("v", MultiExtentReference(2, [[0, 2, "memory://good", 1]]))
+    assert fs.cat_file("v") == b"bc"
+
+    with pytest.raises(ValueError, match="read-only"):
+        fs.open("v", "wb")
+
+
+@pytest.mark.asyncio
+async def test_v2_async_write_is_rejected(rec):
+    rec.pipe("memory://good", b"abc")
+    fs = _v2_fs(
+        rec,
+        refs={
+            "version": 2,
+            "refs": {"v": {"size": 3, "extents": [[0, 3, "memory://good", 0]]}},
+        },
+    )
+    with pytest.raises(ValueError, match="version-2"):
+        await fs._pipe_file("v", b"no")

@@ -5,9 +5,9 @@ import itertools
 import logging
 import math
 import os
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from itertools import chain
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import fsspec.core
 from fsspec.spec import AbstractBufferedFile
@@ -40,6 +40,183 @@ class ReferenceNotReachable(RuntimeError):
 
     def __str__(self):
         return f'Reference "{self.reference}" failed to fetch target {self.target}'
+
+
+class ExtentReferenceError(ReferenceNotReachable):
+    """A source byte extent of a version-2 reference could not be read.
+
+    Carries the virtual path, the logical byte range being assembled and the
+    concrete source location, while keeping the original backend exception as
+    the cause. Holes are never used to paper over failures of this kind.
+    """
+
+    def __init__(self, reference, logical_range, target, source_range, cause=None):
+        super().__init__(reference, target)
+        self.logical_range = logical_range
+        self.source_range = source_range
+        if cause is not None:
+            self.__cause__ = cause
+
+    def __str__(self):
+        message = (
+            f'Reference "{self.reference}" failed reading logical bytes '
+            f"{self.logical_range[0]}-{self.logical_range[1]} from target "
+            f"{self.target} at source bytes "
+            f"{self.source_range[0]}-{self.source_range[1]}"
+        )
+        cause = self.__cause__
+        if cause is not None:
+            message += f": {type(cause).__name__}: {cause}"
+        return message
+
+
+class Extent(NamedTuple):
+    """One mapped byte region of a version-2 virtual file.
+
+    Attributes
+    ----------
+    offset: int
+        Logical offset of the region inside the virtual file.
+    length: int
+        Number of bytes the region occupies (in both the virtual file and
+        the source). May be zero, in which case the extent is descriptive
+        only and never triggers source access.
+    url: str or None
+        Source URL. ``None`` resolves to the filesystem's default target.
+    source_offset: int
+        Offset of the first source byte backing ``offset``.
+    """
+
+    offset: int
+    length: int
+    url: str | None
+    source_offset: int
+
+
+def _v2_nonneg_int(value, name):
+    """Validate a version-2 scalar: a finite, non-negative integer.
+
+    ``bool`` is explicitly rejected even though it subclasses ``int``, and
+    floats (including ``nan``/``inf``) are rejected rather than coerced.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            f"{name} must be a finite, non-negative integer; got "
+            f"{type(value).__name__}: {value!r}"
+        )
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative; got {value}")
+    return value
+
+
+class MultiExtentReference:
+    """Version-2 reference describing one virtual file.
+
+    The virtual file has an explicit logical ``size`` and is assembled from
+    external byte ``extents``. Every extent maps a contiguous logical range
+    ``[offset, offset + length)`` onto source bytes
+    ``[source_offset, source_offset + length)`` of ``url``. Logical ranges not
+    covered by any extent are holes and read back as zero bytes.
+
+    All descriptors are validated at construction time, before any source
+    data is accessed. The caller's extent list is copied, never reordered or
+    mutated in place; overlapping descriptors raise instead of being silently
+    overwritten by a sort.
+    """
+
+    def __init__(self, size, extents):
+        self.size = _v2_nonneg_int(size, "size")
+        if not isinstance(extents, (list, tuple)):
+            raise TypeError(
+                "extents must be a list of [offset, length, url, source_offset]"
+            )
+        made = []
+        for i, extent in enumerate(extents):
+            if not isinstance(extent, (list, tuple)) or len(extent) != 4:
+                raise ValueError(
+                    f"extents[{i}] must be a 4-element "
+                    "[offset, length, url, source_offset] sequence"
+                )
+            offset, length, url, source_offset = extent
+            offset = _v2_nonneg_int(offset, f"extents[{i}].offset")
+            length = _v2_nonneg_int(length, f"extents[{i}].length")
+            source_offset = _v2_nonneg_int(source_offset, f"extents[{i}].source_offset")
+            if url is not None and not isinstance(url, str):
+                raise TypeError(
+                    f"extents[{i}].url must be a string URL or None; got "
+                    f"{type(url).__name__}"
+                )
+            if offset + length > self.size:
+                raise ValueError(
+                    f"extents[{i}] covers logical bytes {offset}-"
+                    f"{offset + length}, beyond the virtual size {self.size}"
+                )
+            made.append(Extent(offset, length, url, source_offset))
+
+        # Detect overlaps on a sorted copy: a descriptor error must never be
+        # hidden by reordering the caller's input.
+        prev_end = 0
+        for extent in sorted(made, key=lambda e: e.offset):
+            if extent.offset < prev_end:
+                raise ValueError(
+                    f"extents overlap at logical offset {extent.offset}; "
+                    "every logical byte may be backed by at most one extent"
+                )
+            prev_end = max(prev_end, extent.offset + extent.length)
+        self.extents = tuple(made)
+
+    @cached_property
+    def ordered_extents(self):
+        """Extents in ascending logical order, as required by the reader."""
+        return tuple(sorted(self.extents, key=lambda e: e.offset))
+
+    def to_dict(self):
+        """Plain JSON-serialisable form, using fresh lists."""
+        return {
+            "size": self.size,
+            "extents": [list(extent) for extent in self.extents],
+        }
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, MultiExtentReference)
+            and self.size == other.size
+            and self.extents == other.extents
+        )
+
+    def __repr__(self):
+        return f"MultiExtentReference(size={self.size}, extents={list(self.extents)!r})"
+
+
+def _normalize_virtual_slice(size, start, end):
+    """Clamp ``start``/``end`` onto a virtual file of ``size`` bytes.
+
+    Mirrors Python slicing of a ``bytes`` object of that length, including
+    negative indices and empty results for out-of-range or reversed windows.
+    """
+    start = 0 if start is None else start
+    end = size if end is None else end
+    if start < 0:
+        start = max(size + start, 0)
+    elif start > size:
+        start = size
+    if end < 0:
+        end = max(size + end, 0)
+    elif end > size:
+        end = size
+    if end < start:
+        end = start
+    return start, end
+
+
+class _ExtentJob(NamedTuple):
+    """One physical source read needed to assemble a virtual window."""
+
+    url: str
+    src_start: int
+    src_end: int
+    virt_start: int
+    virt_end: int
 
 
 def _first(d):
@@ -801,6 +978,19 @@ class ReferenceFileSystem(AsyncFileSystem):
                         self.fss[protocol] = fs
                         # only use first remote URL
                         break
+                if isinstance(ref, MultiExtentReference):
+                    # version-2 files may be the only remote references.
+                    # A None extent URL resolves to self.target, so it still
+                    # contributes a protocol to derive.
+                    candidate = next(
+                        (extent.url for extent in ref.extents if extent.url),
+                        self.target,
+                    )
+                    if candidate:
+                        protocol, _ = fsspec.core.split_protocol(candidate)
+                        if protocol not in self.fss:
+                            fs = filesystem(protocol, **(remote_options or {}))
+                            self.fss[protocol] = fs
 
         if remote_protocol and remote_protocol not in self.fss:
             fs = filesystem(remote_protocol, **(remote_options or {}))
@@ -816,6 +1006,145 @@ class ReferenceFileSystem(AsyncFileSystem):
                     "Reference-FS's target filesystem must have same value "
                     "of asynchronous"
                 )
+
+    def _get_reference(self, path):
+        try:
+            return self.references[path]
+        except KeyError as exc:
+            raise FileNotFoundError(path) from exc
+
+    def _plan_extent_jobs(self, ref, vstart, vend):
+        """Map the virtual window ``[vstart, vend)`` onto source reads.
+
+        Only extents intersecting the window produce jobs; holes and
+        zero-length extents produce no job and therefore no source access.
+        Each job remembers both its physical source range and its logical
+        position, so ``source_offset`` is never mistaken for a virtual offset.
+        """
+        jobs = []
+        for extent in ref.ordered_extents:
+            if extent.length == 0:
+                # explicit no-side-effect rule: nothing to read, nothing to
+                # fetch, no request is ever issued for the extent
+                continue
+            lo = extent.offset
+            hi = lo + extent.length
+            rlo = max(lo, vstart)
+            rhi = min(hi, vend)
+            if rlo >= rhi:
+                continue
+            url = extent.url if extent.url is not None else self.target
+            shift = rlo - lo
+            jobs.append(
+                _ExtentJob(
+                    url=url,
+                    src_start=extent.source_offset + shift,
+                    src_end=extent.source_offset + (rhi - lo),
+                    virt_start=rlo,
+                    virt_end=rhi,
+                )
+            )
+        return jobs
+
+    def _prepare_multi_extent(self, path, ref, start, end):
+        """Normalise the slice and merge same-source physical ranges.
+
+        Returns the normalised window, the per-extent jobs and the merged
+        ``(urls, starts, ends)`` physical request triples. Distinct URLs (and
+        therefore distinct protocols) are never merged.
+        """
+        vstart, vend = _normalize_virtual_slice(ref.size, start, end)
+        if vstart >= vend:
+            return vstart, vend, [], ([], [], [])
+        jobs = self._plan_extent_jobs(ref, vstart, vend)
+        if not jobs:
+            # the whole window is holes: answer from zero bytes alone
+            return vstart, vend, [], ([], [], [])
+        merged = merge_offset_ranges(
+            [job.url for job in jobs],
+            [job.src_start for job in jobs],
+            [job.src_end for job in jobs],
+            sort=True,
+            max_gap=self.max_gap,
+            max_block=self.max_block,
+        )
+        return vstart, vend, jobs, merged
+
+    def _verify_extent_block(self, path, logical_range, url, source_range, data):
+        s, e = source_range
+        expected = e - s
+        if len(data) < expected:
+            # a short read must fail loudly rather than be hidden by the
+            # zero-filled holes surrounding the extent
+            cause = ValueError(
+                f"short read from {url}: expected {expected} source bytes "
+                f"[{s}, {e}), got {len(data)}"
+            )
+            raise ExtentReferenceError(path, logical_range, url, source_range, cause)
+        if len(data) > expected:
+            data = data[:expected]
+        return data
+
+    def _assemble_multi_extent(self, vstart, vend, jobs, merged, blocks):
+        """Place fetched source bytes back at their logical positions.
+
+        The output starts as zeros, so holes need no network at all. Every
+        job is sliced out of the (possibly merged) block that covers it using
+        physical offsets, then written at its virtual position.
+        """
+        out = bytearray(vend - vstart)
+        urls, starts, ends = merged
+        for job in jobs:
+            for url, s, e, data in zip(urls, starts, ends, blocks):
+                if url == job.url and s <= job.src_start and job.src_end <= e:
+                    chunk = data[job.src_start - s : job.src_end - s]
+                    lo = job.virt_start - vstart
+                    out[lo : lo + len(chunk)] = chunk
+                    break
+            else:  # pragma: no cover - merge_offset_ranges guarantees coverage
+                raise RuntimeError(
+                    "Internal error: no merged source block covered "
+                    f"{job} of virtual range [{vstart}, {vend})"
+                )
+        return bytes(out)
+
+    def _cat_multi_extent(self, path, ref, start, end):
+        vstart, vend, jobs, merged = self._prepare_multi_extent(path, ref, start, end)
+        if vstart >= vend or not jobs:
+            return b"\x00" * (vend - vstart)
+        urls, starts, ends = merged
+        blocks = []
+        for url, s, e in zip(urls, starts, ends):
+            protocol, _ = split_protocol(url)
+            try:
+                data = self.fss[protocol].cat_file(url, start=s, end=e)
+            except Exception as exc:
+                raise ExtentReferenceError(
+                    path, (vstart, vend), url, (s, e), exc
+                ) from exc
+            blocks.append(
+                self._verify_extent_block(path, (vstart, vend), url, (s, e), data)
+            )
+        return self._assemble_multi_extent(vstart, vend, jobs, merged, blocks)
+
+    async def _cat_multi_extent_async(self, path, ref, start, end):
+        vstart, vend, jobs, merged = self._prepare_multi_extent(path, ref, start, end)
+        if vstart >= vend or not jobs:
+            return b"\x00" * (vend - vstart)
+        urls, starts, ends = merged
+        blocks = []
+        for url, s, e in zip(urls, starts, ends):
+            protocol, _ = split_protocol(url)
+            try:
+                data = await self.fss[protocol]._cat_file(url, start=s, end=e)
+            except Exception as exc:
+                raise ExtentReferenceError(
+                    path, (vstart, vend), url, (s, e), exc
+                ) from exc
+            blocks.append(
+                self._verify_extent_block(path, (vstart, vend), url, (s, e), data)
+            )
+        return self._assemble_multi_extent(vstart, vend, jobs, merged, blocks)
 
     def _cat_common(self, path, start=None, end=None):
         path = self._strip_protocol(path)
@@ -862,6 +1191,12 @@ class ReferenceFileSystem(AsyncFileSystem):
         return url, start1, end1
 
     async def _cat_file(self, path, start=None, end=None, **kwargs):
+        stripped = self._strip_protocol(path)
+        part = self._get_reference(stripped)
+        if isinstance(part, MultiExtentReference):
+            return await self._cat_multi_extent_async(
+                stripped, part, start=start, end=end
+            )
         part_or_url, start0, end0 = self._cat_common(path, start=start, end=end)
         if isinstance(part_or_url, bytes):
             return part_or_url[start:end]
@@ -874,6 +1209,10 @@ class ReferenceFileSystem(AsyncFileSystem):
             raise ReferenceNotReachable(path, part_or_url) from e
 
     def cat_file(self, path, start=None, end=None, **kwargs):
+        stripped = self._strip_protocol(path)
+        part = self._get_reference(stripped)
+        if isinstance(part, MultiExtentReference):
+            return self._cat_multi_extent(stripped, part, start=start, end=end)
         part_or_url, start0, end0 = self._cat_common(path, start=start, end=end)
         if isinstance(part_or_url, bytes):
             return part_or_url[start:end]
@@ -883,9 +1222,28 @@ class ReferenceFileSystem(AsyncFileSystem):
         except Exception as e:
             raise ReferenceNotReachable(path, part_or_url) from e
 
+    def _guard_v2_write(self, path, value):
+        """Reject half-compatible overwrites of version-2 references.
+
+        A multi-extent virtual file can only be replaced by another fully
+        validated MultiExtentReference; plain inline writes are refused rather
+        than silently producing a mixed-meaning entry via ``pipe_file``.
+        """
+        if isinstance(
+            self.references.get(path), MultiExtentReference
+        ) and not isinstance(value, MultiExtentReference):
+            raise ValueError(
+                f"Cannot overwrite version-2 multi-extent reference {path!r} "
+                "with inline or single-range data; remove it explicitly first "
+                "or supply a MultiExtentReference with validated update rules"
+            )
+
     def pipe_file(self, path, value, **_):
         """Temporarily add binary data or reference as a file"""
+        self._guard_v2_write(path, value)
         self.references[path] = value
+        if isinstance(value, MultiExtentReference):
+            self.dircache.clear()
 
     async def _get_file(self, rpath, lpath, **kwargs):
         if self.isdir(rpath):
@@ -931,8 +1289,26 @@ class ReferenceFileSystem(AsyncFileSystem):
             raise NotImplementedError
         if isinstance(path, list) and (recursive or any("*" in p for p in path)):
             raise NotImplementedError
+        # Version-2 multi-extent files cannot be expressed as (url, start, end)
+        # triples, so route them through their own reader instead of the
+        # classic range-merging pipeline.
+        if isinstance(path, str):
+            if isinstance(self.references.get(path), MultiExtentReference):
+                try:
+                    return self.cat_file(path)
+                except Exception:
+                    if on_error != "omit":
+                        raise
+                    return b""
+            classic_paths = [path]
+        else:
+            classic_paths = [
+                p
+                for p in path
+                if not isinstance(self.references.get(p), MultiExtentReference)
+            ]
         # TODO: if references is lazy, pre-fetch all paths in batch before access
-        proto_dict = _protocol_groups(path, self.references)
+        proto_dict = _protocol_groups(classic_paths, self.references)
         out = {}
         for proto, paths in proto_dict.items():
             fs = self.fss[proto]
@@ -1022,6 +1398,20 @@ class ReferenceFileSystem(AsyncFileSystem):
                 else:
                     del out[k]
 
+        if isinstance(path, list):
+            # multi-extent files keep their rich ExtentReferenceError rather
+            # than being rewrapped by the classic exception transform above
+            for p in path:
+                if not isinstance(self.references.get(p), MultiExtentReference):
+                    continue
+                try:
+                    out[p] = self.cat_file(p)
+                except Exception as err:
+                    if on_error == "raise":
+                        raise
+                    if on_error != "omit":
+                        out[p] = err
+
         if len(out) == 1 and isinstance(path, str) and "*" not in path:
             return _first(out)
         return out
@@ -1032,6 +1422,8 @@ class ReferenceFileSystem(AsyncFileSystem):
             self._process_references0(references)
         elif vers == 1:
             self._process_references1(references, template_overrides=template_overrides)
+        elif vers == 2:
+            self._process_references2(references)
         else:
             raise ValueError(f"Unknown reference spec version: {vers}")
         # TODO: we make dircache by iterating over all entries, but for Spec >= 1,
@@ -1043,10 +1435,40 @@ class ReferenceFileSystem(AsyncFileSystem):
             # do not do this for lazy/parquet backend, which will not make dicts,
             # but must remain writable in the original object
             references = {
-                key: json.dumps(val) if isinstance(val, dict) else val
+                # MultiExtentReference is already a validated object, not
+                # JSON metadata, so it must not be serialised in place.
+                key: val
+                if isinstance(val, MultiExtentReference)
+                else (json.dumps(val) if isinstance(val, dict) else val)
                 for key, val in references.items()
             }
         self.references = references
+
+    def _process_references2(self, references):
+        """Build references for Spec Version 2.
+
+        Version-2 files are ``{"size": int, "extents": [[offset, length, url,
+        source_offset], ...]}`` descriptors. Classic inline bytes, whole-file
+        and single-range tuple references remain supported alongside them, but
+        version 0/1 tuple shapes keep their original meaning and are never
+        reinterpreted as extent fields.
+        """
+        self.templates = {}
+        self.references = {}
+        for k, v in references.get("refs", {}).items():
+            if isinstance(v, MultiExtentReference):
+                self.references[k] = v
+            elif isinstance(v, dict) and "size" in v and "extents" in v:
+                self.references[k] = MultiExtentReference(v["size"], v["extents"])
+            elif isinstance(v, str):
+                if v.startswith("base64:"):
+                    self.references[k] = base64.b64decode(v[7:])
+                else:
+                    self.references[k] = v
+            elif isinstance(v, dict):
+                self.references[k] = json.dumps(v)
+            else:
+                self.references[k] = v
 
     def _process_references1(self, references, template_overrides=None):
         if not self.simple_templates or self.templates:
@@ -1093,8 +1515,8 @@ class ReferenceFileSystem(AsyncFileSystem):
             if "{{" in v:
                 import jinja2.sandbox
 
-                self.templates[k] = (
-                    lambda temp=v, **kwargs: jinja2.sandbox.SandboxedEnvironment()
+                self.templates[k] = lambda temp=v, **kwargs: (
+                    jinja2.sandbox.SandboxedEnvironment()
                     .from_string(temp)
                     .render(**kwargs)
                 )
@@ -1156,7 +1578,10 @@ class ReferenceFileSystem(AsyncFileSystem):
         self.dircache = {"": []}
         it = self.references.items()
         for path, part in it:
-            if isinstance(part, (bytes, str)) or hasattr(part, "to_bytes"):
+            if isinstance(part, MultiExtentReference):
+                # the virtual size is explicit; no remote size request
+                size = part.size
+            elif isinstance(part, (bytes, str)) or hasattr(part, "to_bytes"):
                 size = len(_inline_data(part))
             elif len(part) == 1:
                 size = None
@@ -1183,6 +1608,22 @@ class ReferenceFileSystem(AsyncFileSystem):
             self.dircache[par].append({"name": path, "type": "file", "size": size})
 
     def _open(self, path, mode="rb", block_size=None, cache_options=None, **kwargs):
+        stripped = self._strip_protocol(path)
+        part = self.references.get(stripped)
+        if isinstance(part, MultiExtentReference):
+            if mode != "rb":
+                raise ValueError(
+                    f"Version-2 multi-extent reference {stripped!r} is read-only; "
+                    "in-place write rules are not defined"
+                )
+            return MultiExtentFile(
+                self,
+                stripped,
+                mode,
+                block_size=block_size,
+                cache_options=cache_options,
+                **kwargs,
+            )
         part_or_url, start0, end0 = self._cat_common(path)
         # This logic is kept outside `ReferenceFile` to avoid unnecessary redirection.
         # That does mean `_cat_common` gets called twice if it eventually reaches `ReferenceFile`.
@@ -1265,6 +1706,9 @@ class ReferenceFileSystem(AsyncFileSystem):
     def info(self, path, **kwargs):
         out = self.references.get(path)
         if out is not None:
+            if isinstance(out, MultiExtentReference):
+                # virtual size comes from the descriptor, never the remote FS
+                return {"name": path, "type": "file", "size": out.size}
             if isinstance(out, (str, bytes)):
                 return {"name": path, "type": "file", "size": len(_inline_data(out))}
             elif len(out) > 1:
@@ -1284,6 +1728,9 @@ class ReferenceFileSystem(AsyncFileSystem):
 
     async def _info(self, path, **kwargs):
         out = self.references.get(path)
+        if isinstance(out, MultiExtentReference):
+            # the virtual size is known up front; no remote size request
+            return {"name": path, "type": "file", "size": out.size}
         if isinstance(out, (list, tuple)) and len(out) == 1:
             # whole remote file: the size must come from the remote FS, which
             # cannot be called synchronously from inside the event loop
@@ -1305,6 +1752,7 @@ class ReferenceFileSystem(AsyncFileSystem):
     async def _pipe_file(self, path, data, mode="overwrite", **kwargs):
         if mode == "create" and self.exists(path):
             raise FileExistsError
+        self._guard_v2_write(path, data)
         # can be str or bytes
         self.references[path] = data
         self.dircache.clear()  # this is a bit heavy handed
@@ -1314,22 +1762,35 @@ class ReferenceFileSystem(AsyncFileSystem):
         if mode == "create" and self.exists(rpath):
             raise FileExistsError
         with open(lpath, "rb") as f:
-            self.references[rpath] = f.read()
+            data = f.read()
+        self._guard_v2_write(rpath, data)
+        self.references[rpath] = data
         self.dircache.clear()  # this is a bit heavy handed
 
     def save_json(self, url, **storage_options):
-        """Write modified references into new location"""
+        """Write modified references into new location.
+
+        Documents containing version-2 multi-extent references are written
+        with ``version`` 2; the extent lists are re-emitted as fresh lists, so
+        the caller's objects are never mutated. Pure version-0/1 stores keep
+        their original ``version`` 1 output.
+        """
         out = {}
+        has_v2 = False
         for k, v in self.references.items():
-            if isinstance(v, bytes):
+            if isinstance(v, MultiExtentReference):
+                has_v2 = True
+                out[k] = v.to_dict()
+            elif isinstance(v, bytes):
                 try:
                     out[k] = v.decode("ascii")
                 except UnicodeDecodeError:
                     out[k] = (b"base64:" + base64.b64encode(v)).decode()
             else:
                 out[k] = v
+        payload = {"version": 2 if has_v2 else 1, "refs": out}
         with fsspec.open(url, "wb", **storage_options) as f:
-            f.write(json.dumps({"version": 1, "refs": out}).encode())
+            f.write(json.dumps(payload).encode())
 
 
 class ReferenceFile(AbstractBufferedFile):
@@ -1385,3 +1846,41 @@ class ReferenceFile(AbstractBufferedFile):
         end = min(end + self.start, self.end)
         self.f.seek(start)
         return self.f.read(end - start)
+
+
+class MultiExtentFile(AbstractBufferedFile):
+    """Buffered reader for a version-2 multi-extent virtual file.
+
+    Every buffered fetch goes through the same normalisation, extent mapping
+    and hole assembly as ``ReferenceFileSystem.cat_file``, so seek/read/
+    readinto always return byte-identical content to direct ``cat_file``
+    calls. The virtual size is taken from the descriptor, so opening the file
+    never triggers a remote size request.
+    """
+
+    def __init__(
+        self,
+        fs,
+        path,
+        mode="rb",
+        block_size="default",
+        autocommit=True,
+        cache_type="readahead",
+        cache_options=None,
+        **kwargs,
+    ):
+        ref = fs.references[path]
+        super().__init__(
+            fs,
+            path,
+            mode=mode,
+            block_size=block_size,
+            autocommit=autocommit,
+            size=ref.size,
+            cache_type=cache_type,
+            cache_options=cache_options,
+            **kwargs,
+        )
+
+    def _fetch_range(self, start, end):
+        return self.fs.cat_file(self.path, start=start, end=end)
